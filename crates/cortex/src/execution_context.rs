@@ -60,6 +60,27 @@ impl ExecutionContext {
         }
     }
 
+    /// Build an unrestricted context in `dir`, which must be an absolute
+    /// path to an existing directory. Symlinks are resolved, so the context,
+    /// the session's stored folder and the undo-point store agree on one
+    /// name for it.
+    pub fn unrestricted_in(dir: &Path) -> Result<Self> {
+        if !dir.is_absolute() {
+            bail!("{} is not an absolute path", dir.display());
+        }
+        let resolved = match dir.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                bail!("{} does not exist", dir.display())
+            }
+            Err(e) => return Err(e).with_context(|| format!("{} cannot be opened", dir.display())),
+        };
+        if !resolved.is_dir() {
+            bail!("{} is not a folder", dir.display());
+        }
+        Ok(Self::unrestricted(resolved))
+    }
+
     /// Build the default context from the process cwd with no root enforcement.
     pub fn from_process() -> Result<Self> {
         let cwd =
@@ -296,7 +317,34 @@ pub(crate) fn synthesize_canonical_for_write(candidate: &Path) -> Result<PathBuf
 #[cfg(test)]
 mod tests {
     use super::ExecutionContext;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    /// A working folder is named by an absolute path to a directory that
+    /// exists, and the context holds its resolved form with no fence.
+    #[cfg(unix)]
+    #[test]
+    fn unrestricted_in_takes_an_existing_absolute_folder_and_resolves_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let real = base.join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        std::os::unix::fs::symlink(&real, base.join("link")).expect("symlink");
+        std::fs::write(base.join("file"), "x").expect("seed");
+
+        let ctx = ExecutionContext::unrestricted_in(&base.join("link")).expect("a folder");
+        assert_eq!(ctx.workspace_cwd(), real);
+        assert_eq!(ctx.workspace_root(), real);
+        assert!(!ctx.enforce_workspace_root());
+
+        let refused = |path: &Path| {
+            ExecutionContext::unrestricted_in(path)
+                .expect_err("must be refused")
+                .to_string()
+        };
+        assert!(refused(Path::new("real")).contains("is not an absolute path"));
+        assert!(refused(&base.join("gone")).contains("does not exist"));
+        assert!(refused(&base.join("file")).contains("is not a folder"));
+    }
 
     fn workspace_ctx() -> (tempfile::TempDir, ExecutionContext) {
         let tmp = tempfile::tempdir().expect("tempdir");

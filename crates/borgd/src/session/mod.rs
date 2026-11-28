@@ -343,6 +343,11 @@ impl SessionHost {
         self.inner.backend.new_agent_session().await
     }
 
+    /// The folder this session works in, when its backend has one.
+    pub fn working_dir(&self) -> Option<std::path::PathBuf> {
+        self.inner.backend.working_dir()
+    }
+
     /// Load an existing agent session in this host.
     pub fn load_agent_session(&self, id: &str) -> Result<u64> {
         self.inner.backend.load_agent_session(id)

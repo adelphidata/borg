@@ -60,7 +60,7 @@ use protocols::session::{
     AppendAssistantMessageRequest, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest,
     CompactRequest, CompactResponse, ContextBreakdown, ExecShellRequest, ExecShellResponse,
     ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, OpenRequest, PromptResponse, RewindRequest, RewindResponse,
+    NewSessionResponse, OpenRequest, OpenResponse, PromptResponse, RewindRequest, RewindResponse,
     RollbackRequest, RollbackResponse, SendRequest, SessionState, SessionStateRequest,
     SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
@@ -354,9 +354,8 @@ impl DaemonClient {
         workspace_root: Option<&std::path::Path>,
         enforce_workspace_root: bool,
     ) -> Result<(String, u64)> {
-        let resp = self
-            .session
-            .open(OpenRequest {
+        let opened = self
+            .open_with(OpenRequest {
                 resume_id: resume_id.unwrap_or_default().to_string(),
                 workspace_cwd: workspace_cwd
                     .map(|p| p.to_string_lossy().to_string())
@@ -365,11 +364,49 @@ impl DaemonClient {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default(),
                 enforce_workspace_root,
+                working_dir: String::new(),
             })
+            .await?;
+        Ok((opened.session_id, opened.last_event_seq))
+    }
+
+    /// Open a session for a command run in a terminal.
+    ///
+    /// `worktree` is the `--worktree` directory, and the session is confined
+    /// to it. Without one the session works, unconfined, in the directory the
+    /// command was run from: `borgd` is a long-lived process with a directory
+    /// of its own, and the person at the terminal means the one they are in.
+    pub async fn open_cli_session(
+        &mut self,
+        resume_id: Option<&str>,
+        worktree: Option<&std::path::Path>,
+    ) -> Result<CliSession> {
+        let here = match std::env::current_dir() {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                tracing::warn!(
+                    "the current directory is unreadable, so the session gets none: {e}"
+                );
+                None
+            }
+        };
+        let opened = self
+            .open_with(cli_open_request(resume_id, worktree, here.as_deref()))
+            .await?;
+        Ok(CliSession {
+            works_elsewhere: works_elsewhere(&opened.working_dir, worktree.or(here.as_deref())),
+            id: opened.session_id,
+            last_event_seq: opened.last_event_seq,
+        })
+    }
+
+    async fn open_with(&mut self, request: OpenRequest) -> Result<OpenResponse> {
+        Ok(self
+            .session
+            .open(request)
             .await
             .context("Session.Open failed")?
-            .into_inner();
-        Ok((resp.session_id, resp.last_event_seq))
+            .into_inner())
     }
 
     /// Send a user message and stream the resulting `AgentEvent`s for this
@@ -1460,6 +1497,139 @@ rpc_wrappers! {
         pair_credential("Admin.PairCredential", protocols::admin::PairCredentialRequest {
             kind: kind.to_string(),
         }).entries;
+}
+
+/// The session a terminal command was given.
+pub struct CliSession {
+    pub id: String,
+    pub last_event_seq: u64,
+    /// The folder the session works in, when it is not the one the command
+    /// asked for. A conversation that is still open in the daemon keeps the
+    /// folder it has, and a daemon that cannot use the command's folder
+    /// (another machine's path over a forwarded socket) falls back to its
+    /// default.
+    pub works_elsewhere: Option<std::path::PathBuf>,
+}
+
+impl CliSession {
+    /// What to tell the person at the terminal when the session does not
+    /// work in the folder they are in.
+    pub fn elsewhere_notice(&self) -> Option<String> {
+        let dir = self.works_elsewhere.as_ref()?;
+        Some(format!(
+            "Working in {}, not in the folder borg was started in.",
+            dir.display()
+        ))
+    }
+}
+
+/// The folder the daemon `reported` for a session, when it is not the one
+/// the command `asked` for. A daemon that reports none predates the field,
+/// and is taken at the command's word.
+fn works_elsewhere(reported: &str, asked: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    if reported.is_empty() {
+        return None;
+    }
+    let resolved = |dir: &std::path::Path| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let reported = std::path::PathBuf::from(reported);
+    let same = asked.is_some_and(|asked| resolved(asked) == resolved(&reported));
+    (!same).then_some(reported)
+}
+
+/// The `Session.Open` request of a terminal command: confined to `worktree`
+/// when there is one, else working in `here` (the directory the command was
+/// run from) with no confinement.
+fn cli_open_request(
+    resume_id: Option<&str>,
+    worktree: Option<&std::path::Path>,
+    here: Option<&std::path::Path>,
+) -> OpenRequest {
+    let text = |dir: Option<&std::path::Path>| {
+        dir.map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    OpenRequest {
+        resume_id: resume_id.unwrap_or_default().to_string(),
+        workspace_cwd: text(worktree),
+        workspace_root: String::new(),
+        enforce_workspace_root: false,
+        working_dir: match worktree {
+            Some(_) => String::new(),
+            None => text(here),
+        },
+    }
+}
+
+#[cfg(test)]
+mod cli_open_request_tests {
+    use super::{cli_open_request, works_elsewhere, CliSession};
+    use std::path::Path;
+
+    /// A terminal session works where the command was run; `--worktree`
+    /// replaces that with a confined workspace and never sends both.
+    #[test]
+    fn a_terminal_session_works_where_it_was_run_unless_it_has_a_worktree() {
+        let here = Path::new("/home/u/project");
+        let tree = Path::new("/home/u/.borg-worktrees/fix");
+
+        let plain = cli_open_request(Some("s1"), None, Some(here));
+        assert_eq!(plain.resume_id, "s1");
+        assert_eq!(plain.working_dir, "/home/u/project");
+        assert_eq!(plain.workspace_cwd, "");
+
+        let confined = cli_open_request(None, Some(tree), Some(here));
+        assert_eq!(confined.workspace_cwd, "/home/u/.borg-worktrees/fix");
+        assert_eq!(confined.working_dir, "");
+        assert_eq!(confined.resume_id, "");
+
+        let nowhere = cli_open_request(None, None, None);
+        assert_eq!(nowhere.working_dir, "");
+        assert_eq!(nowhere.workspace_cwd, "");
+    }
+
+    /// The daemon says where the session works. The person is told only
+    /// when that is not where they are: a conversation still open elsewhere,
+    /// or a folder the daemon cannot use.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_that_works_somewhere_else_is_reported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let here = base.join("here");
+        let other = base.join("other");
+        std::fs::create_dir_all(&here).expect("mkdir");
+        std::fs::create_dir_all(&other).expect("mkdir");
+        std::os::unix::fs::symlink(&here, base.join("link")).expect("symlink");
+        let text = |dir: &Path| dir.to_string_lossy().into_owned();
+
+        assert_eq!(works_elsewhere(&text(&here), Some(&here)), None);
+        // One folder under two names is one folder.
+        assert_eq!(
+            works_elsewhere(&text(&here), Some(&base.join("link"))),
+            None
+        );
+        // A daemon that does not say is taken at the command's word.
+        assert_eq!(works_elsewhere("", Some(&here)), None);
+        assert_eq!(
+            works_elsewhere(&text(&other), Some(&here)),
+            Some(other.clone())
+        );
+        assert_eq!(works_elsewhere(&text(&other), None), Some(other.clone()));
+
+        let session = |works_elsewhere| CliSession {
+            id: "s".to_string(),
+            last_event_seq: 0,
+            works_elsewhere,
+        };
+        assert_eq!(session(None).elsewhere_notice(), None);
+        assert_eq!(
+            session(Some(other.clone())).elsewhere_notice(),
+            Some(format!(
+                "Working in {}, not in the folder borg was started in.",
+                other.display()
+            ))
+        );
+    }
 }
 
 #[cfg(test)]

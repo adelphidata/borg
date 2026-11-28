@@ -225,6 +225,10 @@ pub trait SessionBackend: Send + Sync + 'static {
     async fn new_agent_session(&self) -> anyhow::Result<String> {
         Err(anyhow::anyhow!("new_session not supported by this backend"))
     }
+    /// The folder this session works in, when the backend has one.
+    fn working_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
     /// Load an existing agent session from disk by id.
     fn load_agent_session(&self, _id: &str) -> anyhow::Result<u64> {
         Err(anyhow::anyhow!(
@@ -345,7 +349,7 @@ pub struct AgentBackend {
     /// behind a Mutex so two concurrent `Send` RPCs to the same session
     /// (which the protocol forbids but the transport doesn't enforce) queue
     /// safely instead of corrupting state.
-    agent: Mutex<Agent>,
+    agent: Arc<Mutex<Agent>>,
     /// Steer channel sender — held here so `Session.Steer` can push text
     /// into the running turn even though the agent is locked.
     steer_tx: mpsc::UnboundedSender<String>,
@@ -364,6 +368,9 @@ pub struct AgentBackend {
     last_snapshot: std::sync::Mutex<Option<SessionStateSnapshot>>,
     /// Taken by the next turn, and lifted when it ends.
     next_turn_pin: std::sync::Mutex<Option<cortex::agent::ConfigPin>>,
+    /// The folder the agent works in: the one it was opened with, else the
+    /// daemon's own. Fixed for the life of the backend.
+    working_dir: Option<std::path::PathBuf>,
 }
 
 /// The agent's user-facing state, read under its lock.
@@ -411,12 +418,19 @@ impl AgentBackend {
         goal_bus: Option<crate::goal_bus::GoalEventBus>,
     ) -> anyhow::Result<Arc<Self>> {
         let mut agent = Agent::new(config, metrics).await?;
-        // Captured before the context is moved into the agent: the client's
-        // workspace (when provided) is the session's real working directory,
-        // which the workspace stamp below prefers over the daemon's own cwd.
-        let workspace_cwd_hint = execution_context
+        // Captured before the context is moved into the agent: the folder
+        // the session works in. Without a context the agent works in the
+        // daemon's own directory.
+        let working_dir = execution_context
             .as_ref()
-            .map(|c| c.workspace_cwd().to_path_buf());
+            .map(|c| c.workspace_cwd().to_path_buf())
+            .or_else(|| match std::env::current_dir() {
+                Ok(dir) => Some(dir.canonicalize().unwrap_or(dir)),
+                Err(e) => {
+                    tracing::warn!("the daemon's own directory is unreadable, so the session reports no folder: {e}");
+                    None
+                }
+            });
         if let Some(execution_context) = execution_context {
             agent.set_execution_context(execution_context);
         }
@@ -491,15 +505,11 @@ impl AgentBackend {
         // may be one the user or the titler gave it.
         if let Ok(db) = cortex::db::Database::open().await {
             let now = chrono::Utc::now().timestamp();
-            // Client-provided workspace wins; a daemon opened without one
-            // falls back to its own process cwd (best-effort — TUI clients
-            // re-stamp with their real cwd right after open).
-            let stamp_cwd = workspace_cwd_hint.or_else(|| std::env::current_dir().ok());
             materialize_session_row(
                 &db,
                 &session_id,
                 &agent.config().llm.model,
-                stamp_cwd.as_deref(),
+                working_dir.as_deref(),
             )
             .await;
             // Take ownership of the session up front. A conflict here (another
@@ -523,13 +533,14 @@ impl AgentBackend {
         let first_snapshot = snapshot_of(&agent);
         Ok(Arc::new(Self {
             session_id,
-            agent: Mutex::new(agent),
+            agent: Arc::new(Mutex::new(agent)),
             steer_tx,
             steer_gate,
             worker_id,
             lease_epoch: AtomicI64::new(initial_epoch),
             last_snapshot: std::sync::Mutex::new(Some(first_snapshot)),
             next_turn_pin: std::sync::Mutex::new(None),
+            working_dir,
         }))
     }
 
@@ -804,43 +815,52 @@ impl SessionBackend for AgentBackend {
         // a moment's wait, because a turn that has just ended on screen can
         // hold the agent a little longer (its auto-save, its hooks), and so
         // does every short call that only reads it.
-        let Ok(mut agent) = tokio::time::timeout(ROLLBACK_LOCK_WAIT, self.agent.lock()).await
-        else {
-            return Ok(RollbackReply {
-                report: "A turn is still running. Wait for it to finish, or stop it first."
-                    .to_string(),
-                changed: false,
-                points: Vec::new(),
-            });
-        };
-        match request {
-            RollbackRequest::List => {
-                let points = agent.undo_points().await?;
-                let report = cortex::agent::rollback::describe_undo_points(
-                    &points,
-                    &agent.undo_folder(),
-                    chrono::Utc::now().timestamp(),
-                );
-                Ok(RollbackReply {
-                    report,
+        let held_by = Arc::clone(&self.agent);
+        // In a task of its own: a restore moves files one step after
+        // another, and a caller that goes away (a closed tab, a dropped
+        // connection) drops this call. The work must not stop with it and
+        // leave the folder between two states.
+        let work = tokio::spawn(async move {
+            let Ok(mut agent) = tokio::time::timeout(ROLLBACK_LOCK_WAIT, held_by.lock()).await
+            else {
+                return Ok(RollbackReply {
+                    report: "A turn is still running. Wait for it to finish, or stop it first."
+                        .to_string(),
                     changed: false,
-                    points,
-                })
-            }
-            RollbackRequest::Restore(number) => {
-                let outcome = agent.rollback_files(number).await?;
-                let changed = matches!(
-                    &outcome,
-                    cortex::agent::rollback::RollbackOutcome::Restored(done)
-                        if !done.restored.is_empty() || !done.removed.is_empty()
-                );
-                Ok(RollbackReply {
-                    report: outcome.report(),
-                    changed,
                     points: Vec::new(),
-                })
+                });
+            };
+            match request {
+                RollbackRequest::List => {
+                    let points = agent.undo_points().await?;
+                    let report = cortex::agent::rollback::describe_undo_points(
+                        &points,
+                        &agent.undo_folder(),
+                        chrono::Utc::now().timestamp(),
+                    );
+                    Ok(RollbackReply {
+                        report,
+                        changed: false,
+                        points,
+                    })
+                }
+                RollbackRequest::Restore(number) => {
+                    let outcome = agent.rollback_files(number).await?;
+                    let changed = matches!(
+                        &outcome,
+                        cortex::agent::rollback::RollbackOutcome::Restored(done)
+                            if !done.restored.is_empty() || !done.removed.is_empty()
+                    );
+                    Ok(RollbackReply {
+                        report: outcome.report(),
+                        changed,
+                        points: Vec::new(),
+                    })
+                }
             }
-        }
+        });
+        work.await
+            .map_err(|e| anyhow::anyhow!("the rollback stopped unexpectedly: {e}"))?
     }
 
     fn rewind_to_nth_user_message(&self, n: usize) -> anyhow::Result<usize> {
@@ -873,6 +893,10 @@ impl SessionBackend for AgentBackend {
             }
         }
         Ok(id)
+    }
+
+    fn working_dir(&self) -> Option<std::path::PathBuf> {
+        self.working_dir.clone()
     }
 
     fn load_agent_session(&self, id: &str) -> anyhow::Result<u64> {
@@ -1054,6 +1078,87 @@ impl SessionBackend for AgentBackend {
     }
 }
 
+/// Where a session works when its client named no folder: where a resumed
+/// session last worked, else the `conversation.default_folder` setting.
+/// `None` leaves the agent in the daemon's own directory, as before either
+/// existed.
+///
+/// A folder the session cannot be given (deleted since, not creatable) is
+/// logged and passed over; it never fails the open.
+pub async fn default_execution_context(
+    config: &Config,
+    resume_id: Option<&str>,
+) -> Option<cortex::execution_context::ExecutionContext> {
+    let stored = match resume_id {
+        Some(id) => stored_folder(id).await,
+        None => None,
+    };
+    let daemon_dir = std::env::current_dir()
+        .ok()
+        .map(|dir| dir.canonicalize().unwrap_or(dir));
+    let dir = default_folder(
+        stored.as_deref(),
+        config.conversation.default_folder.as_deref(),
+        daemon_dir.as_deref(),
+    )?;
+    match cortex::execution_context::ExecutionContext::unrestricted_in(&dir) {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            tracing::warn!("a session was not given its folder: {e:#}");
+            None
+        }
+    }
+}
+
+/// The folder recorded for `session_id` the last time it was open.
+async fn stored_folder(session_id: &str) -> Option<std::path::PathBuf> {
+    let row = match cortex::db::Database::open().await {
+        Ok(db) => db.session_by_id(session_id).await,
+        Err(e) => Err(e),
+    };
+    match row {
+        Ok(row) => row?.cwd.map(std::path::PathBuf::from),
+        Err(e) => {
+            tracing::warn!(session_id = %session_id, "the session's folder was not read: {e:#}");
+            None
+        }
+    }
+}
+
+/// Choose between a resumed session's `stored` folder and the `configured`
+/// default.
+///
+/// The stored one wins while it still exists: a conversation carries on
+/// where it worked. One equal to `daemon_dir` is not a choice anybody made —
+/// it is the stamp a session without a folder got — so it does not shadow
+/// the setting. The configured folder has a leading `~` expanded, must be
+/// absolute, and is made if it is missing.
+fn default_folder(
+    stored: Option<&std::path::Path>,
+    configured: Option<&str>,
+    daemon_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = stored.filter(|dir| dir.is_dir() && Some(*dir) != daemon_dir) {
+        return Some(dir.to_path_buf());
+    }
+    let configured = configured.map(str::trim).filter(|raw| !raw.is_empty())?;
+    let dir = std::path::PathBuf::from(cortex::util::unix_ext::expand_tilde(configured));
+    if !dir.is_absolute() {
+        tracing::warn!(
+            "conversation.default_folder is `{configured}`, which is not an absolute path; ignored"
+        );
+        return None;
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(
+            "conversation.default_folder `{}` could not be made: {e}; ignored",
+            dir.display()
+        );
+        return None;
+    }
+    Some(dir)
+}
+
 /// Write the `sessions` row for a session that is about to take turns, and
 /// stamp its workspace identity so workspace-scoped resume (`borg
 /// --continue`) can find it again. A row that already exists keeps its
@@ -1088,6 +1193,56 @@ async fn materialize_session_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resumed conversation carries on where it worked; a new one, or one
+    /// whose folder is gone or was only ever the daemon's own, gets the
+    /// configured default.
+    #[test]
+    fn a_session_without_a_folder_gets_its_last_one_or_the_configured_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let last = base.join("last");
+        let daemon = base.join("daemon");
+        let configured = base.join("configured");
+        for dir in [&last, &daemon, &configured] {
+            std::fs::create_dir(dir).expect("mkdir");
+        }
+        let setting = configured.to_string_lossy().into_owned();
+        let gone = base.join("gone");
+
+        let pick = |stored: Option<&std::path::Path>, configured: Option<&str>| {
+            default_folder(stored, configured, Some(&daemon))
+        };
+        assert_eq!(pick(Some(&last), Some(&setting)), Some(last.clone()));
+        assert_eq!(pick(Some(&last), None), Some(last.clone()));
+        assert_eq!(pick(None, Some(&setting)), Some(configured.clone()));
+        assert_eq!(pick(Some(&gone), Some(&setting)), Some(configured.clone()));
+        assert_eq!(pick(Some(&daemon), Some(&setting)), Some(configured));
+        assert_eq!(pick(Some(&daemon), None), None);
+        assert_eq!(pick(None, None), None);
+        assert_eq!(pick(None, Some("  ")), None);
+    }
+
+    /// The configured folder is made on first use; one that cannot name a
+    /// place (relative) or cannot be made (under a file) is passed over.
+    #[test]
+    fn the_configured_folder_is_made_when_missing_and_skipped_when_unusable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonicalize");
+        let fresh = base.join("work/borg");
+        std::fs::write(base.join("file"), "x").expect("seed");
+
+        let picked = default_folder(None, Some(&format!(" {} ", fresh.display())), None);
+        assert_eq!(picked, Some(fresh.clone()));
+        assert!(fresh.is_dir(), "the folder was not made");
+
+        assert_eq!(default_folder(None, Some("work/borg"), None), None);
+        let under_a_file = base.join("file/inside");
+        assert_eq!(
+            default_folder(None, Some(&under_a_file.to_string_lossy()), None),
+            None
+        );
+    }
 
     /// Regression: calling `lock_agent` from within a multi-thread tokio
     /// runtime (which is what every production gRPC handler does) must not

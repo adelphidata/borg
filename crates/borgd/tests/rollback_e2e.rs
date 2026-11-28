@@ -12,7 +12,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use borgd::session::backend::{AgentBackend, RollbackRequest, SessionBackend};
+use borgd::session::backend::{
+    default_execution_context, AgentBackend, RollbackRequest, SessionBackend,
+};
 use cortex::config::Config;
 use cortex::db::{Database, NewSessionSnapshot};
 use cortex::execution_context::ExecutionContext;
@@ -31,7 +33,36 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// A session confined to its workspace, as an editor or `--worktree`
+    /// opens one.
     async fn new() -> Self {
+        Self::open(|ws| {
+            let ctx = ExecutionContext::for_workspace(ws.to_path_buf(), ws.to_path_buf())
+                .expect("workspace context");
+            async move { (Config::default(), Some(ctx)) }
+        })
+        .await
+    }
+
+    /// A session whose client named no folder — the web and desktop apps —
+    /// on a daemon with the workspace as its configured default.
+    async fn in_the_default_folder() -> Self {
+        Self::open(|ws| {
+            let mut config = Config::default();
+            config.conversation.default_folder = Some(ws.to_string_lossy().into_owned());
+            async move {
+                let ctx = default_execution_context(&config, None).await;
+                (config, ctx)
+            }
+        })
+        .await
+    }
+
+    async fn open<F, Fut>(session: F) -> Self
+    where
+        F: FnOnce(&Path) -> Fut,
+        Fut: std::future::Future<Output = (Config, Option<ExecutionContext>)>,
+    {
         let guard = ENV_LOCK.lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let base = tmp.path().canonicalize().expect("canonicalize");
@@ -43,19 +74,11 @@ impl Fixture {
         // and on every data-dir lookup after it.
         unsafe { std::env::set_var("BORG_HOME", &home) };
 
-        let ctx =
-            ExecutionContext::for_workspace(ws.clone(), ws.clone()).expect("workspace context");
-        let backend = AgentBackend::new(
-            Config::default(),
-            BorgMetrics::default(),
-            None,
-            None,
-            None,
-            Some(ctx),
-            None,
-        )
-        .await
-        .expect("backend builds without an LLM provider");
+        let (config, ctx) = session(&ws).await;
+        let backend =
+            AgentBackend::new(config, BorgMetrics::default(), None, None, None, ctx, None)
+                .await
+                .expect("backend builds without an LLM provider");
         Self {
             backend,
             store: CheckpointStore::new(&home),
@@ -221,4 +244,145 @@ async fn rollback_is_refused_while_the_agent_is_busy() {
         .expect("rollback");
     assert!(reply.changed, "{}", reply.report);
     assert_eq!(fx.read("notes.txt").as_deref(), Some("before\n"));
+}
+
+/// A caller that goes away mid-rollback (a closed tab, a dropped connection)
+/// drops the call. The restore still runs to its end: a folder left between
+/// two states because nobody was listening would be the worst outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rollback_finishes_after_its_caller_is_gone() {
+    let fx = Fixture::new().await;
+    fx.write("notes.txt", "before\n");
+    fx.undo_point().await;
+    fx.write("notes.txt", "after\n");
+    fx.write("new.txt", "made by the agent\n");
+
+    // Far too short for a restore, which runs git several times over.
+    let hung_up = tokio::time::timeout(
+        std::time::Duration::from_millis(1),
+        fx.backend.rollback(RollbackRequest::Restore(None)),
+    )
+    .await;
+    assert!(
+        hung_up.is_err(),
+        "the rollback answered within a millisecond"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while fx.read("notes.txt").as_deref() != Some("before\n") || fx.read("new.txt").is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restore stopped with its caller: notes.txt = {:?}, new.txt = {:?}",
+            fx.read("notes.txt"),
+            fx.read("new.txt")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // The agent is free again once the work is done.
+    let list = fx
+        .backend
+        .rollback(RollbackRequest::List)
+        .await
+        .expect("list");
+    assert!(list.report.contains("before a rollback"), "{}", list.report);
+}
+
+/// The web and desktop apps name no folder. With a default folder set, the
+/// session works there without being fenced in, its files can be put back,
+/// and a later resume — setting or no setting — carries on in the same place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_with_no_folder_of_its_own_works_in_the_default_one() {
+    let fx = Fixture::in_the_default_folder().await;
+    let state = fx.backend.snapshot_state().expect("state");
+
+    fx.write("notes.txt", "before\n");
+    fx.undo_point().await;
+    fx.write("notes.txt", "after\n");
+
+    let done = fx
+        .backend
+        .rollback(RollbackRequest::Restore(None))
+        .await
+        .expect("rollback");
+    assert!(done.changed, "{}", done.report);
+    assert_eq!(fx.read("notes.txt").as_deref(), Some("before\n"));
+
+    let resumed = default_execution_context(&Config::default(), Some(&state.agent_session_id))
+        .await
+        .expect("a resumed session has the folder it worked in");
+    assert_eq!(resumed.workspace_cwd(), fx.ws);
+    assert!(
+        !resumed.enforce_workspace_root(),
+        "a default folder is a place to work, not a fence"
+    );
+
+    let unknown = default_execution_context(&Config::default(), Some("no-such-session")).await;
+    assert!(unknown.is_none(), "a session nobody stored has no folder");
+}
+
+/// A turn that reaches the daemon with no client behind it — a channel
+/// message, a scheduled task, the heartbeat — names no folder either, and
+/// works in the default one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_channel_session_works_in_the_default_folder() {
+    use gateway::session_executor::{InboundTurn, SessionExecutor, TurnKind};
+
+    let _guard = ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().canonicalize().expect("canonicalize");
+    let home = base.join("home");
+    let folder = base.join("work");
+    std::fs::create_dir_all(&home).unwrap();
+    // SAFETY: serialized by `ENV_LOCK`.
+    unsafe { std::env::set_var("BORG_HOME", &home) };
+    // A daemon has its database before any turn arrives; without one the
+    // pause check fails safe and no session is made.
+    // It also has a row for this conversation, stamped with a folder from
+    // an earlier life. Nobody chose that folder for it, so it does not count.
+    let stale = base.join("stale");
+    std::fs::create_dir_all(&stale).unwrap();
+    {
+        let db = Database::open().await.expect("database");
+        db.ensure_session_row("telegram:42", 0, "model")
+            .await
+            .expect("row");
+        db.set_session_workspace("telegram:42", &stale.to_string_lossy(), None)
+            .await
+            .expect("stamp");
+    }
+    let mut config = Config::default();
+    config.conversation.default_folder = Some(folder.to_string_lossy().into_owned());
+    let registry = borgd::session::SessionRegistry::new();
+    let executor = borgd::session::DaemonSessionExecutor::new(
+        registry.clone(),
+        config,
+        BorgMetrics::default(),
+        None,
+        None,
+        None,
+    );
+
+    // No LLM provider is configured, so the turn itself fails. The session
+    // it was for exists all the same, in its folder.
+    let (mut events, _cancel) = executor
+        .start_turn(InboundTurn {
+            session_key: "telegram:42".into(),
+            text: "hello".into(),
+            images: vec![],
+            kind: TurnKind::User,
+        })
+        .await
+        .expect("start_turn");
+    while tokio::time::timeout(std::time::Duration::from_secs(20), events.recv())
+        .await
+        .expect("the turn ends")
+        .is_some()
+    {}
+
+    let live = registry.live_ids();
+    let [id] = live.as_slice() else {
+        panic!("one live session, got {live:?}");
+    };
+    let host = registry.peek(id).expect("a live session");
+    assert_eq!(host.working_dir(), Some(folder));
 }

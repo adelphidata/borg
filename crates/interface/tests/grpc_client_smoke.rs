@@ -345,6 +345,7 @@ async fn daemon_client_round_trips_a_turn() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("Open must succeed against a live daemon")

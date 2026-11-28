@@ -80,10 +80,14 @@ pub async fn one_shot(
             .await
             .context("switch the collaboration mode")?;
     }
-    let (session_id, _last_seq) = session_client
-        .open_session_with_workspace(None, workspace.as_deref(), None, false)
+    let opened = session_client
+        .open_cli_session(None, workspace.as_deref())
         .await
         .context("open one-shot session")?;
+    if let Some(notice) = opened.elsewhere_notice() {
+        eprintln!("{notice}");
+    }
+    let session_id = opened.id;
     let stream = session_client
         .send_message(&session_id, message)
         .await

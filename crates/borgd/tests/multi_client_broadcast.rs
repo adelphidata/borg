@@ -137,6 +137,7 @@ async fn two_clients_subscribed_to_same_session_see_identical_event_streams() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open")

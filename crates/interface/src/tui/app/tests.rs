@@ -3194,6 +3194,118 @@ fn tab_inside_paste_burst_is_pasted_not_bound() {
     }
 }
 
+/// Longer than the paste detector waits before it calls a burst finished.
+const PAST_THE_BURST: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// `/r`, then the rest of `/rollback list` arriving as a paste burst: the
+/// text the popup filters on is still `/r…`, and its pick is another command.
+fn app_with_a_command_pasted_behind_the_popup() -> App<'static> {
+    let mut app = make_app();
+    app.composer.set_text("/r");
+    app.command_popup.update_filter("/r");
+    app.composer.feed_paste_burst_for_test("ollback list");
+    let pick = app.command_popup.selected_command().expect("a pick");
+    assert_ne!(pick.name, "/rollback", "the popup would pick the right one");
+    app
+}
+
+fn is_rollback_list(action: &AppAction) -> bool {
+    matches!(
+        action,
+        AppAction::RollbackFiles {
+            list_only: true,
+            ..
+        }
+    )
+}
+
+/// A whole command plus Enter written in one burst (a paste into a terminal
+/// without bracketed paste, a script writing to the pty). The Enter is part
+/// of the paste: nothing runs — least of all the popup's pick for the two
+/// characters that had landed — and the text arrives whole.
+#[test]
+fn enter_inside_a_paste_burst_is_pasted_and_runs_no_command() {
+    let mut app = app_with_a_command_pasted_behind_the_popup();
+
+    let action = app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    assert!(matches!(action, AppAction::Continue));
+    assert!(
+        app.cells.is_empty(),
+        "a command ran on an Enter that was pasted text"
+    );
+    std::thread::sleep(PAST_THE_BURST);
+    app.tick_paste_burst();
+    assert_eq!(app.composer.text(), "/rollback list\n");
+    assert!(
+        !app.command_popup.is_visible(),
+        "the popup kept its pick for text that is no longer there"
+    );
+
+    // Pressed by hand afterwards, Enter runs what is on screen.
+    let action = app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert!(is_rollback_list(&action), "the wrong command ran");
+}
+
+/// The same paste without its Enter, then Enter by hand before the next
+/// tick: the pasted text lands first, and the command on screen runs.
+#[test]
+fn enter_after_a_paste_burst_runs_the_command_on_screen() {
+    let mut app = app_with_a_command_pasted_behind_the_popup();
+    std::thread::sleep(PAST_THE_BURST);
+
+    let action = app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    assert!(is_rollback_list(&action), "the wrong command ran");
+    assert_eq!(app.composer.text(), "");
+}
+
+/// Text that lands on a tick, with no key press, reaches the `/` popup too:
+/// a popup filtered by the text from before the paste is a wrong answer
+/// waiting for Enter.
+#[test]
+fn the_command_popup_follows_text_that_lands_on_a_tick() {
+    let mut app = make_app();
+    app.composer.set_text("/r");
+    app.command_popup.update_filter("/r");
+    app.composer.feed_paste_burst_for_test("ollback");
+    std::thread::sleep(PAST_THE_BURST);
+
+    app.tick_paste_burst();
+
+    assert_eq!(app.composer.text(), "/rollback");
+    let pick = app.command_popup.selected_command().expect("a pick");
+    assert_eq!(pick.name, "/rollback");
+}
+
+/// While a turn runs, no key reaches the `/` popup, so pasted text must not
+/// open it: it would keep its first pick through what is typed next and run
+/// that pick, not the text on screen, on the first Enter after the turn.
+#[test]
+fn a_paste_during_a_turn_opens_no_popup() {
+    for land in [
+        (|app: &mut App<'_>| app.tick_paste_burst()) as fn(&mut App<'_>),
+        |app: &mut App<'_>| {
+            let _ = app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        },
+    ] {
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: std::time::Instant::now(),
+        };
+        app.composer.feed_paste_burst_for_test("/rollback");
+        std::thread::sleep(PAST_THE_BURST);
+
+        land(&mut app);
+
+        assert!(app.composer.text().starts_with("/rollback"));
+        assert!(
+            !app.command_popup.is_visible(),
+            "a popup opened where no key can reach it"
+        );
+    }
+}
+
 #[test]
 fn mode_usage_lists_only_modes_that_mode_accepts() {
     let mut app = make_app();

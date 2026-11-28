@@ -88,16 +88,29 @@ message Empty {}
 message OpenRequest {
   // Optional resume_id — if set, daemon resumes that session's history.
   string resume_id = 1;
-  // Optional workspace context for session-scoped execution.
+  // Optional workspace context for session-scoped execution. A session
+  // given one is confined to `workspace_root`.
   string workspace_cwd = 2;
   string workspace_root = 3;
   bool enforce_workspace_root = 4;
+  // The folder the session works in, without confinement: relative paths
+  // and the shell start there, project instructions are read from it, and
+  // undo points cover it. An absolute path to an existing directory.
+  // Ignored when a workspace context is given. Empty: the daemon chooses —
+  // the folder a resumed session last worked in, else the
+  // `conversation.default_folder` setting, else its own directory.
+  string working_dir = 5;
 }
 
 message OpenResponse {
   string session_id = 1;
   // Last event_seq currently buffered for this session (0 for new).
   uint64 last_event_seq = 2;
+  // The folder the session works in: where its relative paths resolve and
+  // what its undo points cover. A resumed session that is still live keeps
+  // the folder it has, whatever the request named, so a client reads it here
+  // rather than assuming its own. Empty from a daemon without the field.
+  string working_dir = 3;
 }
 
 message SendRequest {

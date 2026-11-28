@@ -90,13 +90,20 @@ impl DaemonSessionExecutor {
         // resume_id — `Agent::load_session` falls back to a fresh session
         // when the id is unknown, which is the right behavior for the
         // first-ever inbound from this `(sender, thread)`.
+        // Nobody names a folder for these sessions (a channel, a scheduled
+        // task, the heartbeat), so they work in the configured default. They
+        // follow the setting rather than a folder stored for the session:
+        // none was ever chosen for it.
+        let config = self.current_config();
+        let execution_context =
+            crate::session::backend::default_execution_context(&config, None).await;
         let backend = AgentBackend::new(
-            self.current_config(),
+            config,
             self.metrics.clone(),
             Some(session_key),
             self.config_rx.clone(),
             self.cost_event_sink.clone(),
-            None,
+            execution_context,
             self.goal_bus.clone(),
         )
         .await?;

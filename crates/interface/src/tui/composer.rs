@@ -378,16 +378,24 @@ impl<'a> Composer<'a> {
     }
 
     /// Called on each tick to flush any paste-burst buffer.
-    pub fn tick(&mut self) {
-        self.flush_due_burst(Instant::now());
+    /// Insert a paste burst that has gone idle. True when text was inserted:
+    /// whatever follows the composer's text (the `/` and `@` popups) is then
+    /// out of date.
+    pub fn tick(&mut self) -> bool {
+        self.flush_due_burst(Instant::now())
     }
 
-    /// Insert a burst whose idle timeout has passed at `now`. The tick does
-    /// this too, but ticks are skipped while a popup is open, so key
-    /// handling must not trust that an idle burst is still a live paste.
-    fn flush_due_burst(&mut self, now: Instant) {
-        if let Some(text) = self.paste_burst.flush_if_due(now) {
-            self.insert_burst_text(&text);
+    /// Insert a burst whose idle timeout has passed at `now`, and say
+    /// whether there was one. The tick does this too, but ticks are skipped
+    /// while a popup is open, so key handling must not trust that an idle
+    /// burst is still a live paste.
+    fn flush_due_burst(&mut self, now: Instant) -> bool {
+        match self.paste_burst.flush_if_due(now) {
+            Some(text) => {
+                self.insert_burst_text(&text);
+                true
+            }
+            None => false,
         }
     }
 
@@ -396,22 +404,30 @@ impl<'a> Composer<'a> {
             .insert_str(&*super::history::sanitize_user_text(text));
     }
 
-    /// Capture an unmodified Tab into an active paste burst. Without
-    /// bracketed paste a pasted tab arrives as a bare `KeyCode::Tab`, which
-    /// callers otherwise treat as popup completion or ignore mid-stream.
-    /// Callers that bind Tab must ask here first; returns `true` when the
-    /// Tab was consumed as pasted text.
-    pub fn capture_burst_tab(&mut self, key: &KeyEvent) -> bool {
-        self.capture_burst_tab_at(key, Instant::now())
+    /// Capture an unmodified Tab or Enter into an active paste burst.
+    /// Without bracketed paste a pasted tab or line end arrives as a bare
+    /// key between the burst's characters, and the text before it is still
+    /// held back from the composer. A caller that binds either key (popup
+    /// completion, popup accept, steer, submit) must ask here first, or it
+    /// acts on half the paste: `/rollback list` plus Enter in one burst ran
+    /// the popup's pick for `/r`. Returns `true` when the key was consumed
+    /// as pasted text.
+    pub fn capture_burst_control(&mut self, key: &KeyEvent) -> bool {
+        self.capture_burst_control_at(key, Instant::now())
     }
 
-    fn capture_burst_tab_at(&mut self, key: &KeyEvent, now: Instant) -> bool {
+    fn capture_burst_control_at(&mut self, key: &KeyEvent, now: Instant) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
-        if key.code != KeyCode::Tab || key.modifiers != KeyModifiers::NONE {
+        if key.modifiers != KeyModifiers::NONE {
             return false;
         }
+        let pasted = match key.code {
+            KeyCode::Tab => '\t',
+            KeyCode::Enter => '\n',
+            _ => return false,
+        };
         self.flush_due_burst(now);
-        self.paste_burst.append_control_char_if_active('\t', now)
+        self.paste_burst.append_control_char_if_active(pasted, now)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
@@ -435,8 +451,9 @@ impl<'a> Composer<'a> {
         // it before this key so Enter submits and Tab completes as usual.
         self.flush_due_burst(now);
 
-        // Tab mid-burst is pasted whitespace, not a completion/focus key.
-        if self.capture_burst_tab_at(&key, now) {
+        // Tab or Enter mid-burst is pasted text, not a completion or a
+        // submit.
+        if self.capture_burst_control_at(&key, now) {
             return None;
         }
 
@@ -448,11 +465,6 @@ impl<'a> Composer<'a> {
 
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::NONE) => {
-                // During a paste burst, treat Enter as newline instead of submit
-                if self.paste_burst.append_control_char_if_active('\n', now) {
-                    return None;
-                }
-
                 let text: String = self.textarea.lines().join("\n");
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
@@ -1141,7 +1153,7 @@ mod tests {
         c.feed_paste_burst_for_test("abcd");
         let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
         assert!(
-            !c.capture_burst_tab_at(&tab, later),
+            !c.capture_burst_control_at(&tab, later),
             "an expired burst must not capture Tab"
         );
         assert_eq!(c.text(), "abcd");

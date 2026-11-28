@@ -95,7 +95,7 @@ jobs:
         # Ratchet, not the target. The standard is 90%; this number tracks
         # where the workspace actually is and only ever moves up, so coverage
         # can never silently regress while we climb.
-        run: cargo llvm-cov --workspace --lib --bins --no-fail-fast --fail-under-lines 82 --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --lib --bins --no-fail-fast --fail-under-lines 82.5 --lcov --output-path lcov.info
       - name: Coverage total
         # The ratchet can only be raised by someone who can see the number,
         # and the lcov run above prints none. Reads the profile data that run

@@ -1117,6 +1117,13 @@ pub struct ConversationConfig {
     /// Concurrent tool execution settings.
     #[serde(default)]
     pub concurrent_tools: ConcurrentToolsConfig,
+    /// The folder a conversation works in when its client names none: the
+    /// web and desktop apps, and channels. Relative paths and the shell start
+    /// there, and undo points cover it. A leading `~` is expanded and the
+    /// folder is made if it is missing. Unset: the daemon's own directory,
+    /// which undo points do not cover.
+    #[serde(default)]
+    pub default_folder: Option<String>,
     /// Optional deployment-specific guidance rendered as a
     /// `<context_window_guidance>` developer section in the system prompt.
     /// Lets an operator tell the model how to behave as the context window
@@ -1146,6 +1153,7 @@ impl Default for ConversationConfig {
             degradation_min_reclaim_tokens: default_degradation_min_reclaim_tokens(),
             protect_first_n: 3,
             concurrent_tools: ConcurrentToolsConfig::default(),
+            default_folder: None,
             context_window_guidance: String::new(),
         }
     }

@@ -273,12 +273,12 @@ async fn stamp_session_workspace(session_id: &str) {
 
 /// Run the TUI.
 ///
-/// `workspace` is the directory the *agent* must work in, sent to the daemon at
-/// `Session.Open`. It is `Some` only for `borg --worktree <name>`: `borgd` is a
-/// long-lived process with its own current directory, so without this the agent
-/// would edit the main checkout while the client sat in the worktree — the flag
-/// would look like it worked and quietly change the wrong tree. `None` keeps
-/// the daemon's existing default.
+/// `workspace` is the directory the *agent* is confined to, sent to the daemon
+/// at `Session.Open`. It is `Some` only for `borg --worktree <name>`: `borgd`
+/// is a long-lived process with its own current directory, so without this the
+/// agent would edit the main checkout while the client sat in the worktree —
+/// the flag would look like it worked and quietly change the wrong tree. With
+/// `None` the agent works, unconfined, in the directory `borg` was run from.
 pub async fn run(
     resume: Option<String>,
     workspace: Option<std::path::PathBuf>,
@@ -367,15 +367,21 @@ pub async fn run(
     // activity, bond, evolution, budget, script), and config watcher all live
     // inside `borgd` now — registered in `AgentBackend::new` rather than here.
     let mut client = crate::daemon_client::connect_or_spawn().await?;
-    let (session_id, last_seq) = client
-        .open_session_with_workspace(resume.as_deref(), workspace.as_deref(), None, false)
+    let opened = client
+        .open_cli_session(resume.as_deref(), workspace.as_deref())
         .await?;
+    let elsewhere_notice = opened.elsewhere_notice();
+    let (session_id, last_seq) = (opened.id, opened.last_event_seq);
 
-    // Stamp the session's workspace identity with the TUI process's real cwd.
-    // The daemon stamps its own process cwd at open, which is wrong whenever
-    // the (long-lived) daemon was launched from a different directory; this
-    // overwrite keeps `borg --continue` scoped to where the user actually is.
-    stamp_session_workspace(&session_id).await;
+    // Stamp the session's workspace identity with the TUI process's real cwd,
+    // which keeps `borg --continue` scoped to where the user actually is: a
+    // daemon that predates the working folder stamps its own. Not when the
+    // session works somewhere else — the stamp is where a later resume puts
+    // the agent, and it must name the folder the work was done in.
+    let works_here = elsewhere_notice.is_none();
+    if works_here {
+        stamp_session_workspace(&session_id).await;
+    }
 
     // Resume only when explicit: `borg --resume <id>` on the CLI or `/resume
     // <id>` inside the TUI. Launching the TUI with no args always starts a
@@ -392,7 +398,9 @@ pub async fn run(
                 // The conversation continues under the *loaded* session id,
                 // so that row (not just the host's fresh one) carries the
                 // workspace the user resumed it from.
-                stamp_session_workspace(&meta.id).await;
+                if works_here {
+                    stamp_session_workspace(&meta.id).await;
+                }
                 resumed_info = Some((title, count));
             }
             Err(e) => anyhow::bail!("{e}"),
@@ -598,6 +606,9 @@ pub async fn run(
     app.host_session_id = session_id.clone();
     if let Some((title, count)) = resumed_info {
         app.push_system_message(format!("Resumed session: {title} ({count} messages)"));
+    }
+    if let Some(notice) = elsewhere_notice {
+        app.push_system_message(notice);
     }
     // Show drift notice on session start (computed daemon-side from raw
     // vitals state — the cli only renders if non-empty).

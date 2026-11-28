@@ -76,6 +76,26 @@ Undo points are only taken in a project folder. A session that runs in your
 home folder, or in `/`, has none: recording those would mean hashing the
 whole disk.
 
+## Which folder a conversation works in
+
+- **`borg` and `borg ask` in a terminal** work in the folder you ran them
+  from.
+- **`borg --worktree <name>` and editors (ACP)** work in the folder they
+  name, and are confined to it.
+- **The web and desktop apps, channels, scheduled tasks and the heartbeat**
+  name no folder. Set one under **Settings → Advanced → Conversation**
+  (`conversation.default_folder`; "Folder to work in" in the terminal; made
+  if it is missing) and new conversations work there. Project instructions
+  and project skills are then read from that folder too. Without the setting
+  they run in the folder the daemon was started in.
+- A conversation you return to in the web or desktop app carries on in the
+  folder it last worked in.
+- A conversation that is still open keeps its folder. When you resume it from
+  a terminal in another folder, Borg tells you where it works.
+
+Your home folder, a folder above it, and `/` get no undo points: they are
+places projects live in, not projects. Choose a project folder.
+
 A turn waits at most 30 seconds for its undo point. When a folder is too
 large for that, Borg says so once and the conversation makes no more undo
 points there. Stopping a turn (`/stop`) also stops the wait.

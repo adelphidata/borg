@@ -226,6 +226,7 @@ async fn a_resume_carrying_a_message_is_refused_rather_than_dropped() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open ok")
@@ -304,6 +305,7 @@ async fn open_send_streams_deltas_and_terminates_on_turn_complete() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open ok")
@@ -370,6 +372,7 @@ async fn cancel_during_turn_aborts_within_500ms_and_emits_error() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open ok")
@@ -438,6 +441,7 @@ async fn stream_resume_after_disconnect_replays_missed_events_with_no_dupes() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open ok")
@@ -541,6 +545,7 @@ async fn shell_confirmation_round_trips_via_respond_to_prompt() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open ok")
@@ -619,6 +624,7 @@ async fn two_consecutive_sends_yield_disjoint_per_turn_event_streams() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open ok")
@@ -729,6 +735,7 @@ async fn get_state_reports_whether_a_turn_is_in_flight() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open ok")
@@ -821,6 +828,7 @@ async fn send_is_refused_while_the_emergency_pause_is_engaged() {
             workspace_cwd: String::new(),
             workspace_root: String::new(),
             enforce_workspace_root: false,
+            working_dir: String::new(),
         })
         .await
         .expect("open ok")
@@ -872,4 +880,114 @@ async fn send_is_refused_while_the_emergency_pause_is_engaged() {
         "after resume the turn must run: {resumed:?}"
     );
     assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A backend that works in the folder its session was opened with.
+struct FolderBackend {
+    id: String,
+    folder: Option<PathBuf>,
+}
+
+#[async_trait]
+impl SessionBackend for FolderBackend {
+    async fn run_turn(
+        &self,
+        _text: String,
+        _images: Vec<borgd::session::backend::InlineImage>,
+        _event_tx: mpsc::Sender<CoreEvent>,
+        _cancel: CancellationToken,
+        _text_file_bridge: Option<std::sync::Arc<dyn cortex::execution_context::TextFileBridge>>,
+    ) {
+    }
+
+    fn session_id(&self) -> &str {
+        &self.id
+    }
+
+    fn working_dir(&self) -> Option<PathBuf> {
+        self.folder.clone()
+    }
+}
+
+/// Opens every session in the folder the request named, unfenced or fenced
+/// as asked, and keeps what it was asked.
+#[derive(Default)]
+struct FolderFactory {
+    asked: Mutex<Vec<Option<(PathBuf, bool)>>>,
+}
+
+impl SessionFactory for FolderFactory {
+    fn open<'a>(
+        &'a self,
+        resume_id: Option<&'a str>,
+        execution_context: Option<cortex::execution_context::ExecutionContext>,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionHost, anyhow::Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let asked = execution_context.map(|ctx| {
+                (
+                    ctx.workspace_cwd().to_path_buf(),
+                    ctx.enforce_workspace_root(),
+                )
+            });
+            let folder = asked.as_ref().map(|(dir, _)| dir.clone());
+            self.asked.lock().expect("factory poisoned").push(asked);
+            Ok(SessionHost::new(Arc::new(FolderBackend {
+                id: resume_id.unwrap_or("s1").to_string(),
+                folder,
+            })))
+        })
+    }
+}
+
+/// Spec: `working_dir` reaches the session as an unfenced folder, and the
+/// answer says where the session works. A session that is still live keeps
+/// its folder when a second client asks for another one, and the answer says
+/// that too — the client must not assume its own.
+#[tokio::test]
+async fn a_working_folder_goes_over_the_wire_and_a_live_session_keeps_its_own() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().canonicalize().expect("canonicalize");
+    let first = base.join("first");
+    let second = base.join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let factory = Arc::new(FolderFactory::default());
+    let (socket, _shutdown) = spawn_session_service(tmp.path(), factory.clone()).await;
+    let mut client = SessionClient::new(uds_channel(socket).await);
+    let open = |resume_id: &str, working_dir: &std::path::Path| OpenRequest {
+        resume_id: resume_id.to_string(),
+        workspace_cwd: String::new(),
+        workspace_root: String::new(),
+        enforce_workspace_root: false,
+        working_dir: working_dir.to_string_lossy().into_owned(),
+    };
+
+    let opened = client
+        .open(open("", &first))
+        .await
+        .expect("open ok")
+        .into_inner();
+    assert_eq!(opened.working_dir, first.to_string_lossy());
+    assert_eq!(
+        factory.asked.lock().unwrap().as_slice(),
+        [Some((first.clone(), false))],
+        "the folder must arrive, and without a fence"
+    );
+
+    let again = client
+        .open(open(&opened.session_id, &second))
+        .await
+        .expect("open ok")
+        .into_inner();
+    assert_eq!(again.session_id, opened.session_id);
+    assert_eq!(
+        again.working_dir,
+        first.to_string_lossy(),
+        "a live session keeps its folder"
+    );
+    assert_eq!(
+        factory.asked.lock().unwrap().len(),
+        1,
+        "no second session may be made"
+    );
 }
